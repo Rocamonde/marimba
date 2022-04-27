@@ -1,0 +1,218 @@
+#!/usr/bin/env python
+import datetime
+import multiprocessing
+import os
+import pathlib
+from typing import List
+
+import avocado
+import click
+import marimba as mbm
+from joblib import Parallel, delayed
+from marimba.settings import *
+from marimba.utils import tqdm_joblib
+from tqdm import tqdm
+import subprocess
+import json
+import signal
+from marimba.model.io import load_model_info, get_dataset, models_dict
+from marimba.model.train import train as train_model
+
+
+@click.group()
+def marimba():
+    pass
+
+
+@marimba.group()
+def bgproc():
+    pass
+
+
+@bgproc.command()
+@click.argument('command')
+def run(command: str):
+    """Run a command in the background."""
+    path = pathlib.Path(LOGS_DIR) / 'bgproc'
+    path.mkdir(exist_ok=True)
+    command_name = command.split()[0]
+    datetime_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_file = path / f'{command_name}_{datetime_stamp}.log'
+    running_cmds_file = pathlib.Path(LOGS_DIR) / 'running.json'
+    if not running_cmds_file.exists():
+        running_cmds_file.touch()
+    log_file.touch()
+
+    cmd = f'nohup {command} > {log_file} 2>&1'
+
+    # Execute command in the background and get the process ID
+    subproc = subprocess.Popen(
+        cmd,
+        shell=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid)
+
+    pid = subproc.pid
+
+    # Read the running commands file and add the new command to it
+    with open(running_cmds_file, 'r') as f:
+        try:
+            running_cmds = json.load(f)
+        except json.decoder.JSONDecodeError:
+            running_cmds = []
+
+    running_cmds.append({'command': command, 'pid': pid,
+                         'log_file': str(log_file), 'datetime': datetime_stamp})
+
+    # Write the running commands file
+    with open(running_cmds_file, 'w') as f:
+        json.dump(running_cmds, f, indent=4)
+
+    print(f'Running command: {command}')
+    print(f'Log file: {log_file}')
+    print(f'PID: {pid}')
+    print(f'\nYou are free to close this terminal. The output of the log file will now be tailed\n')
+    # Tail the log file
+    subprocess.run(f'tail -f {log_file}', shell=True)
+
+
+@bgproc.command()
+def tail():
+    """Tail the log files of the most recent command."""
+    running_cmds_file = pathlib.Path(LOGS_DIR) / 'running.json'
+    with open(running_cmds_file, 'r') as f:
+        running_cmds = json.load(f)
+    if len(running_cmds) == 0:
+        print('No commands have been run yet or are currently running.')
+        return
+    latest_cmd = running_cmds[-1]
+    subprocess.run(f'tail -f {latest_cmd["log_file"]}', shell=True)
+
+
+@bgproc.command()
+@click.argument('pid')
+def stop(pid: str):
+    """Stop background processes."""
+    running_cmds_file = pathlib.Path(LOGS_DIR) / 'running.json'
+
+    with open(running_cmds_file, 'r') as f:
+        running_cmds: List = json.load(f)
+
+    found = False
+    for cmd in running_cmds:
+        if str(cmd['pid']) == str(pid):
+            found = True
+            try:
+                print(f'Stopping process {cmd["pid"]}')
+                os.killpg(os.getpgid(cmd['pid']), signal.SIGTERM)
+            except ProcessLookupError:
+                print(f'Process {cmd["pid"]} is no longer running')
+            finally:
+                running_cmds.remove(cmd)
+            break
+
+    if not found:
+        print(f'Process {pid} not found')
+
+    with open(running_cmds_file, 'w') as f:
+        json.dump(running_cmds, f, indent=4)
+
+
+@marimba.command()
+@click.argument('model_info_name')
+@click.option('--save', is_flag=True, default=True)
+@click.option('--train-slice', default=TRAIN_SLICE)
+@click.option('--val-slice', default=TEST_SLICE)
+@click.option('--no-augment', is_flag=True, default=False)
+def train(model_info_name: str, save: bool, train_slice: int, val_slice: int, no_augment: bool):
+    """Train a specified machine learning model."""
+    model_info_path = pathlib.Path(MODEL_INFO_DIR) / f'{model_info_name}.yaml'
+
+    if not model_info_path.exists():
+        raise FileNotFoundError(
+            f'Model info file {model_info_path} does not exist.')
+
+    model_info = load_model_info(str(model_info_path))
+
+    print('Starting training at time ' + str(datetime.datetime.now()))
+
+    X_val, y_val = get_dataset('plasticc_test', slice=val_slice)
+
+    if no_augment:
+        X_train, y_train = get_dataset(
+            'plasticc_train', slice=train_slice)
+    else:
+        X_train, y_train = get_dataset(
+            'plasticc_augment', slice=train_slice)
+
+    dim = 1 if model_info.build.model.endswith('1d') else 2
+
+    X_train = models_dict[model_info.build.model]['preprocess'](
+        X_train, model_info, dim=dim)
+    X_val = models_dict[model_info.build.model]['preprocess'](
+        X_val, model_info, dim=dim)
+
+    train_model(
+        model_info,
+        datasets=(X_train, X_val, y_train, y_val),
+        save=save
+    )
+
+
+@marimba.command()
+@click.argument('reference_dataset')
+@click.argument('augmented_dataset')
+@click.option('--num_augments', type=int, default=100,
+              help='The number of times to use each object in the dataset as a '
+              'reference for augmentation. Note that augmentation sometimes fails, '
+              'so this is the number of tries, not the number of sucesses. '
+              '(default: %(default)s)')
+@click.option('--num_chunks', type=int, default=100,
+              help='The dataset will be processed in chunks to avoid loading all of '
+              'the data at once. This sets the total number of chunks to use. '
+              '(default: %(default)s)')
+@click.option('--chunk', type=int, default=None,
+              help='If set, only process this chunk of the dataset. This is '
+              'intended to be used to split processing into multiple jobs.')
+def augment(chunk: int, **kwargs):
+    """Augment dataset using avocado"""
+    print("Loading augmentor...")
+    augmentor = avocado.plasticc.PlasticcAugmentor()
+
+    if chunk is not None:
+        mbm.preprocess.augment.process_chunk(augmentor, chunk, **kwargs)
+    else:
+        num_cores = multiprocessing.cpu_count()
+        with tqdm_joblib(tqdm(desc="Chunk", total=kwargs.get('num_chunks'))) as progress_bar:
+            Parallel(n_jobs=num_cores)(
+                delayed(mbm.preprocess.augment.process_chunk)(
+                    augmentor, chunk, **kwargs, verbose=True)
+                for chunk in range(kwargs.get('num_chunks'))
+            )
+
+
+@marimba.command()
+@click.argument('dataset')
+@click.option('--num-chunks', default=100, type=int,
+              help='The dataset will be processed in chunks to avoid loading all of '
+              'the data at once. This sets the total number of chunks to use. '
+              '(default: %(default)s)')
+def fit(dataset: str, num_chunks: int = 100):
+    """Compute GP fits using avocado"""
+
+    print('Starting fit at time ' + str(datetime.datetime.now()))
+
+    num_cores = multiprocessing.cpu_count()
+
+    with tqdm(desc="Chunk", total=num_chunks) as progress_bar:
+        Parallel(n_jobs=num_cores)(
+            delayed(mbm.preprocess.fit.fit_chunk)(
+                dataset, chunk, num_chunks, verbose=False, write=False)
+            for chunk in range(num_chunks))
+
+    print("Done!")
+
+
+if __name__ == '__main__':
+    marimba()

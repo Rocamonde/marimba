@@ -1,0 +1,12 @@
+.Rhistory
+data/**/*
+.idea/**/*
+venv/**/*
+venv-x86/**/*
+.ipynb_checkpoints/**/*
+**/.DS_Store
+**/logs/**/*
+**/logs*/**/*
+**/saved_models/**/*
+**/*.egg-info/**/*
+**/__pycache__/**/*
